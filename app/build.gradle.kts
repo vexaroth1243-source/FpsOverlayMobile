@@ -14,8 +14,20 @@ android {
         versionCode = 1
         versionName = "1.0"
     }
+    // Sabit imza: her derleme aynı anahtarla imzalanır, yeni sürüm eskisinin üstüne kurulur.
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("keystore/fpsoverlay.jks")
+            storePassword = "fpsoverlay"
+            keyAlias = "fpsoverlay"
+            keyPassword = "fpsoverlay"
+        }
+    }
     buildTypes {
-        release { isMinifyEnabled = false }
+        release {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
