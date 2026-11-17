@@ -1,6 +1,9 @@
 package com.fpsoverlay
 
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Handler
+import android.os.Looper
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings as AndroidSettings
@@ -49,7 +52,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -62,6 +68,7 @@ private val GreenC = Color(0xFF2EA043)
 private val RedC = Color(0xFFDA3633)
 private val BlueC = Color(0xFF2F81F7)
 private val GrayC = Color(0xFF6E7681)
+private const val ADB_CMD = "adb shell pm grant com.fpsoverlay android.permission.DUMP"
 
 @Composable
 fun AppTheme(content: @Composable () -> Unit) {
@@ -257,6 +264,7 @@ fun MetricCard(
 @Composable
 fun OverlayTab(snap: Snap, s: Settings, sampler: Sampler) {
     val ctx = LocalContext.current
+    val clipboard = LocalClipboardManager.current
     val running by OverlayService.running.collectAsState()
     var logNote by remember { mutableStateOf("") }
     var reportNote by remember { mutableStateOf("") }
@@ -318,9 +326,32 @@ fun OverlayTab(snap: Snap, s: Settings, sampler: Sampler) {
         Section("Gelişmiş")
         SwitchRow(
             "Root kullan",
-            "Oyunun FPS'ini ölçmek ve okunamayan sensör dosyalarını açmak için gerekir. Root yoksa FPS 'yok' görünür.",
+            "Sadece rootlu telefonlar için. Root yoksa FPS için aşağıdaki 'FPS kurulumu' yeterli.",
             s.useRoot
         ) { s.useRoot = it }
+
+        // FPS kurulumu (root'suz)
+        Section("FPS kurulumu (root'suz)")
+        val dumpOk = ctx.checkSelfPermission("android.permission.DUMP") == PackageManager.PERMISSION_GRANTED
+        Text(
+            if (dumpOk) "FPS izni verilmiş ✓" else "FPS izni verilmemiş",
+            color = if (dumpOk) GreenC else Sub, fontSize = 13.sp
+        )
+        if (!dumpOk) {
+            Text(
+                "Telefonu USB ile bilgisayara bağla ve bilgisayarda şu komutu bir kez çalıştır:",
+                color = Sub, fontSize = 12.sp
+            )
+            Text(
+                ADB_CMD, fontSize = 12.sp, fontFamily = FontFamily.Monospace,
+                modifier = Modifier.fillMaxWidth().background(CardBg).padding(10.dp)
+            )
+            Button(
+                onClick = { clipboard.setText(AnnotatedString(ADB_CMD)) },
+                modifier = Modifier.fillMaxWidth().height(44.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = CardBg)
+            ) { Text("Komutu kopyala") }
+        }
 
         // Kayıt ve rapor
         Section("Kayıt ve rapor")
@@ -338,12 +369,20 @@ fun OverlayTab(snap: Snap, s: Settings, sampler: Sampler) {
 
         Button(
             onClick = {
-                reportNote = try { "Kaydedildi: " + sampler.saveReport() }
-                catch (e: Exception) { "Rapor kaydedilemedi: ${e.message}" }
+                reportNote = "Rapor hazırlanıyor…"
+                Thread {
+                    val msg = try {
+                        val txt = sampler.report()
+                        runCatching { sampler.saveReport() }
+                        Handler(Looper.getMainLooper()).post { clipboard.setText(AnnotatedString(txt)) }
+                        "Rapor panoya kopyalandı. Sohbete yapıştırabilirsin."
+                    } catch (e: Exception) { "Rapor alınamadı: ${e.message}" }
+                    reportNote = msg
+                }.start()
             },
             modifier = Modifier.fillMaxWidth().height(48.dp),
             colors = ButtonDefaults.buttonColors(containerColor = CardBg)
-        ) { Text("Sensör raporunu kaydet") }
+        ) { Text("Sensör raporunu kopyala") }
         if (reportNote.isNotEmpty()) Text(reportNote, color = Sub, fontSize = 12.sp)
         Spacer(Modifier.height(24.dp))
     }

@@ -1,15 +1,18 @@
 package com.fpsoverlay
 
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.SystemClock
 
 data class FpsResult(val fps: Double, val frameMs: Double, val low1Fps: Double?, val process: String)
 
 /**
- * Önde çalışan uygulamanın (oyunun) FPS'i. Android, başka uygulamanın karelerini
- * normal izinle okutmaz; bu yüzden SurfaceFlinger'ın kare zaman damgaları root ile alınır:
+ * Önde çalışan uygulamanın (oyunun) FPS'i. SurfaceFlinger'ın kare zaman damgaları okunur:
  *   dumpsys SurfaceFlinger --latency <katman>
- * Root yoksa FPS "yok" olarak kalır, sahte değer üretilmez.
+ * Bunun için iki yol var:
+ *  1) DUMP izni (bilgisayardan bir kerelik: adb shell pm grant com.fpsoverlay android.permission.DUMP)
+ *  2) Root (su)
+ * İkisi de yoksa FPS "yok" kalır; sahte değer üretilmez.
  */
 class FpsSource(private val ctx: Context, private val s: Settings) {
     var available = false
@@ -17,60 +20,79 @@ class FpsSource(private val ctx: Context, private val s: Settings) {
     var note: String? = null
         private set
 
+    private var mode = "yok"
     private var pkg: String? = null
-    private var layer: String? = null
-    private var layerAt = 0L
     private var label: String? = null
+    private var candidates: List<String> = emptyList()
+    private var candIdx = 0
+    private var layerAt = 0L
 
     private val times = ArrayList<Double>()   // ms, CLOCK_MONOTONIC
     private var lastTs = 0.0
 
-    private val focusRx = Regex("\\s([A-Za-z0-9_.]+)/[A-Za-z0-9_.$]+\\}")
+    // Tanılama (sensör raporuna yazılır)
+    private var dbgFocus = ""
+    private var dbgLayers = ""
+    private var dbgLatency = ""
+
+    private val focusRx = Regex("\\su\\d+\\s([A-Za-z0-9_.]+)/")
+
+    private fun hasDump() =
+        ctx.checkSelfPermission("android.permission.DUMP") == PackageManager.PERMISSION_GRANTED
+
+    private fun pickMode(): Boolean {
+        mode = when {
+            hasDump() -> "adb"
+            s.useRoot && Sys.hasRoot() -> "root"
+            else -> "yok"
+        }
+        return mode != "yok"
+    }
+
+    private fun run(cmd: String, timeoutMs: Long): String? = when (mode) {
+        "adb" -> Sys.sh(cmd, timeoutMs)
+        "root" -> Sys.su(cmd, timeoutMs)
+        else -> null
+    }
 
     fun sample(): FpsResult? {
-        if (!s.useRoot) {
+        if (!pickMode()) {
             available = false
-            note = "FPS ölçümü için root gerekli (Katman sekmesinden 'Root kullan')"
-            return null
-        }
-        if (!Sys.hasRoot()) {
-            available = false
-            note = "Root erişimi alınamadı"
+            note = if (s.useRoot) "Root alınamadı. FPS için adb izni ver (Katman → FPS kurulumu)"
+            else "FPS için bir kerelik izin gerekli (Katman → FPS kurulumu)"
             return null
         }
         available = true
         note = null
 
         val now = SystemClock.elapsedRealtime()
-        if (layer == null || now - layerAt > 3000) resolveLayer(now)
-        val l = layer ?: return null
+        if (candidates.isEmpty() || now - layerAt > 3000) resolveLayers(now)
         val p = pkg ?: return null
+        if (candidates.isEmpty()) return null
 
-        val out = Sys.su("dumpsys SurfaceFlinger --latency '$l'", 2500)
-        if (out == null) { layer = null; return null }
+        val nowMs = System.nanoTime() / 1_000_000.0
+        var frames = latestFrames(candidates[candIdx])
+        val fresh = { f: List<Double>? -> f != null && f.isNotEmpty() && nowMs - f.last() < 2500 }
 
-        val lines = out.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
-        if (lines.size < 2) { layer = null; return null }
-
-        val fresh = ArrayList<Double>()
-        for (ln in lines.drop(1)) {
-            val parts = ln.split(Regex("\\s+"))
-            if (parts.size < 3) continue
-            val t = parts[1].toLongOrNull() ?: continue
-            if (t <= 0L || t == Long.MAX_VALUE) continue   // geçersiz kare
-            val ms = t / 1_000_000.0
-            if (ms > lastTs) fresh.add(ms)
+        if (!fresh(frames)) {
+            // Seçili katman ölü: diğer adayları dene, canlı olanı seç
+            for (i in candidates.indices) {
+                if (i == candIdx) continue
+                val f = latestFrames(candidates[i])
+                if (fresh(f)) {
+                    candIdx = i
+                    frames = f
+                    times.clear(); lastTs = 0.0
+                    break
+                }
+            }
         }
-        fresh.sort()
-        for (ms in fresh) { times.add(ms); lastTs = ms }
-        if (times.isEmpty()) return null
+        val fr = frames
+        if (!fresh(fr) || fr == null) return null
 
+        for (ms in fr) if (ms > lastTs) { times.add(ms); lastTs = ms }
         val keepFrom = lastTs - 10_000
         while (times.isNotEmpty() && times[0] < keepFrom) times.removeAt(0)
-
-        // Bir süredir kare gelmiyorsa akış bayat: değer gösterme
-        val nowMs = System.nanoTime() / 1_000_000.0
-        if (nowMs - lastTs > 2500) return null
 
         val win = times.filter { it > lastTs - 1000 }
         if (win.size < 2) return null
@@ -88,34 +110,66 @@ class FpsSource(private val ctx: Context, private val s: Settings) {
         return FpsResult(fps, frameMs, low1, label ?: p)
     }
 
-    private fun resolveLayer(now: Long) {
+    /** Katmanın geçerli kare zaman damgaları (ms, artan). Okunamazsa null. */
+    private fun latestFrames(layer: String): List<Double>? {
+        val out = run("dumpsys SurfaceFlinger --latency '${layer.replace("'", "")}'", 2500) ?: return null
+        dbgLatency = out.lineSequence().take(4).joinToString(" | ").take(300)
+        val res = ArrayList<Double>()
+        for (ln in out.lineSequence().drop(1)) {
+            val parts = ln.trim().split(Regex("\\s+"))
+            if (parts.size < 3) continue
+            val t = parts[1].toLongOrNull() ?: continue
+            if (t <= 0L || t == Long.MAX_VALUE) continue   // geçersiz kare
+            res.add(t / 1_000_000.0)
+        }
+        res.sort()
+        return res
+    }
+
+    private fun resolveLayers(now: Long) {
         layerAt = now
-        val out = Sys.su("dumpsys window | grep mCurrentFocus; echo @@LAYERS; dumpsys SurfaceFlinger --list", 4000)
-        if (out == null) { layer = null; return }
+        val out = run(
+            "dumpsys window | grep mCurrentFocus; " +
+                "dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity'; " +
+                "echo @@LAYERS; dumpsys SurfaceFlinger --list", 6000
+        )
+        if (out == null) { candidates = emptyList(); dbgFocus = "komut çıktısı alınamadı"; return }
 
         val idx = out.indexOf("@@LAYERS")
         val focus = if (idx >= 0) out.substring(0, idx) else out
         val layerText = if (idx >= 0) out.substring(idx + 8) else ""
+        dbgFocus = focus.trim().take(300).ifEmpty { "boş" }
 
-        val p = focusRx.find(focus)?.groupValues?.get(1)
+        val p = focusRx.findAll(focus).map { it.groupValues[1] }
+            .firstOrNull { it != "com.android.systemui" }
         if (p == null || p == ctx.packageName) {
-            // Önde ölçülecek bir uygulama yok
-            pkg = null; layer = null; label = null
+            pkg = null; candidates = emptyList(); label = null
             times.clear(); lastTs = 0.0
+            dbgLayers = "ölçülecek uygulama yok (önde: ${p ?: "bulunamadı"})"
             return
         }
         if (p != pkg) {
-            times.clear(); lastTs = 0.0
+            times.clear(); lastTs = 0.0; candIdx = 0
             pkg = p
             label = try {
-                val ai = ctx.packageManager.getApplicationInfo(p, 0)
-                ctx.packageManager.getApplicationLabel(ai).toString()
+                ctx.packageManager.getApplicationLabel(ctx.packageManager.getApplicationInfo(p, 0)).toString()
             } catch (e: Exception) { p }
         }
 
-        val names = layerText.lineSequence().map { it.trim() }.filter { it.contains(p) }.toList()
-        layer = names.firstOrNull { it.contains("SurfaceView") && !it.startsWith("Background") }
-            ?: names.firstOrNull { !it.startsWith("Background") }
-            ?: names.firstOrNull()
+        val names = layerText.lineSequence().map { it.trim() }
+            .filter { it.contains(p) && !it.startsWith("Background") }.toList()
+        val prev = candidates.getOrNull(candIdx)
+        val list = (names.filter { it.contains("SurfaceView") } + names).distinct().take(5)
+        candidates = list
+        candIdx = if (prev != null && prev in list) list.indexOf(prev) else 0
+        dbgLayers = "paket=$p, ${list.size} aday: " + list.joinToString(" ; ")
+    }
+
+    fun diag(): String = buildString {
+        appendLine("FPS yöntemi: " + when (mode) { "adb" -> "DUMP izni"; "root" -> "root"; else -> "yok" })
+        appendLine("DUMP izni: " + if (hasDump()) "verilmiş" else "verilmemiş")
+        appendLine("Odak çıktısı: $dbgFocus")
+        appendLine("Katmanlar: $dbgLayers")
+        appendLine("Son --latency çıktısı (ilk satırlar): $dbgLatency")
     }
 }

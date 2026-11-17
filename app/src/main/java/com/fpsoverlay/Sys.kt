@@ -27,9 +27,15 @@ object Sys {
         return ok
     }
 
-    fun su(cmd: String, timeoutMs: Long = 3000): String? {
+    /** Normal uygulama olarak komut çalıştırır (DUMP izni verilmişse dumpsys çalışır). */
+    fun sh(cmd: String, timeoutMs: Long = 3000): String? = exec(listOf("sh", "-c", cmd), timeoutMs)
+
+    /** Root ile komut çalıştırır. */
+    fun su(cmd: String, timeoutMs: Long = 3000): String? = exec(listOf("su", "-c", cmd), timeoutMs)
+
+    private fun exec(args: List<String>, timeoutMs: Long): String? {
         return try {
-            val p = ProcessBuilder("su", "-c", cmd).redirectErrorStream(true).start()
+            val p = ProcessBuilder(args).redirectErrorStream(true).start()
             val sb = StringBuilder()
             val reader = thread(isDaemon = true) {
                 try { sb.append(p.inputStream.bufferedReader().readText()) } catch (_: Exception) {}

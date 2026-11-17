@@ -209,14 +209,19 @@ class Sampler private constructor(private val ctx: Context) {
     }
 
     // --- Doğrulama raporu ---
-    fun saveReport(): String {
+    fun report(): String {
         val sb = StringBuilder()
         sb.appendLine("FPS ölçümü: " + if (fps.available) "çalışıyor" else "kullanılamıyor: ${fps.note}")
         sb.appendLine("Ölçülen uygulama: ${fpsProcess ?: "yok"}")
+        sb.append(fps.diag())
         sb.appendLine()
         sb.append(hw.report())
+        return sb.toString()
+    }
+
+    fun saveReport(): String {
         val f = File(outDir(), "sensor-raporu.txt")
-        f.writeText(sb.toString(), Charsets.UTF_8)
+        f.writeText(report(), Charsets.UTF_8)
         return f.absolutePath
     }
 }
